@@ -116,6 +116,13 @@ def compute_init():
 
     # Distributed setup: Distributed Data Parallel (DDP), optional
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
+    # Treat single-process torchrun (WORLD_SIZE == 1) as non-distributed to avoid unnecessary NCCL setup.
+    if ddp and ddp_world_size <= 1:
+        ddp = False
+        ddp_rank = 0
+        ddp_local_rank = 0
+        ddp_world_size = 1
+
     if ddp:
         # DDP currently assumes CUDA/NCCL
         assert torch.cuda.is_available(), "Distributed execution currently requires CUDA."
