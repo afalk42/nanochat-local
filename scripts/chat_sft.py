@@ -12,12 +12,21 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import copy
+from functools import partial
 
 import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.common import compute_init, compute_cleanup, get_base_dir, print0, DummyWandb
+from nanochat.common import (
+    compute_init,
+    compute_cleanup,
+    get_base_dir,
+    print0,
+    DummyWandb,
+    autocast_context,
+    preferred_autocast_dtype,
+)
 from nanochat.checkpoint_manager import load_model
 from nanochat.checkpoint_manager import save_checkpoint
 from nanochat.engine import Engine
@@ -62,8 +71,9 @@ user_config = {k: globals()[k] for k in config_keys} # possibly useful for loggi
 # Compute init
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init()
 master_process = ddp_rank == 0
-dtype = torch.float32 if dtype == 'float32' else torch.bfloat16
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=dtype)
+dtype_choice = dtype
+dtype = preferred_autocast_dtype(device, dtype_choice)
+autocast_ctx = partial(autocast_context, device=device, dtype=dtype)
 
 # wandb logging init
 use_dummy_wandb = run == "dummy" or not master_process
@@ -172,7 +182,7 @@ for step in range(num_iterations):
         losses = []
         for _ in range(eval_steps):
             val_inputs, val_targets = next(val_iter)
-            with torch.no_grad(), autocast_ctx:
+            with torch.no_grad(), autocast_ctx():
                 loss = model(val_inputs, val_targets)
             losses.append(loss)
         val_loss = torch.stack(losses).mean() # average over eval_steps
@@ -190,7 +200,7 @@ for step in range(num_iterations):
     if last_step or (step > 0 and step % eval_metrics_every == 0):
         model.eval()
         metrics = {}
-        with torch.no_grad(), autocast_ctx:
+        with torch.no_grad(), autocast_ctx():
             # note that because these are inside no_grad, we can usually afford to at least ~2X the batch size
             metrics["mmlu_acc"] = run_chat_eval("MMLU", model, tokenizer, engine, batch_size=device_batch_size*2, max_problems=1024)
             metrics["arc_easy_acc"] = run_chat_eval("ARC-Easy", model, tokenizer, engine, batch_size=device_batch_size*2, max_problems=1024)
@@ -211,7 +221,7 @@ for step in range(num_iterations):
     num_tokens = torch.tensor(0, device=device) # the number of "active" tokens of supervision seen
     for micro_step in range(grad_accum_steps):
         train_inputs, train_targets = next(train_iter)
-        with autocast_ctx:
+        with autocast_ctx():
             loss = model(train_inputs, train_targets)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here

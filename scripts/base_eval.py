@@ -14,12 +14,19 @@ import sys
 import time
 import json
 import random
+from functools import partial
+
 import yaml
-
 import pandas as pd
-import torch
 
-from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir
+from nanochat.common import (
+    compute_init,
+    compute_cleanup,
+    print0,
+    get_base_dir,
+    autocast_context,
+    preferred_autocast_dtype,
+)
 from nanochat.tokenizer import HuggingFaceTokenizer
 from nanochat.checkpoint_manager import load_model
 from nanochat.core_eval import evaluate_task
@@ -122,7 +129,8 @@ def main():
 
     # distributed / precision setup
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init()
-    autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    amp_dtype = preferred_autocast_dtype(device)
+    autocast_ctx = partial(autocast_context, device=device, dtype=amp_dtype)
 
     # Load model and tokenizer from command line or from file system
     if len(sys.argv) >= 2:
@@ -139,7 +147,7 @@ def main():
         model_slug = f"base_model_{meta['step']:06d}" # for the output csv file
 
     # Evaluate the model
-    with autocast_ctx:
+    with autocast_ctx():
         out = evaluate_model(model, tokenizer, device)
 
     # Write out the results to a csv file

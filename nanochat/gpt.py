@@ -31,6 +31,7 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (MQA)
     n_embd: int = 768
+    activation_dtype: str = "bfloat16"
 
 
 def norm(x):
@@ -155,6 +156,7 @@ class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        self.activation_dtype = self._resolve_activation_dtype(config.activation_dtype)
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
@@ -170,7 +172,8 @@ class GPT(nn.Module):
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
         # Cast the embeddings from fp32 to bf16: optim can tolerate it and it saves memory: both in the model and the activations
-        self.transformer.wte.to(dtype=torch.bfloat16)
+        self.transformer.wte.to(dtype=self.activation_dtype)
+        self.rotary_dtype = cos.dtype
 
     def init_weights(self):
         self.apply(self._init_weights)
@@ -184,6 +187,7 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
+        self.rotary_dtype = cos.dtype
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -196,6 +200,20 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=1.0)
+
+    @staticmethod
+    def _resolve_activation_dtype(dtype_value):
+        if isinstance(dtype_value, torch.dtype):
+            return dtype_value
+        if isinstance(dtype_value, str):
+            value = dtype_value.lower()
+            if value in {"bf16", "bfloat16"}:
+                return torch.bfloat16
+            if value in {"fp16", "float16", "half"}:
+                return torch.float16
+            if value in {"fp32", "float32", "single"}:
+                return torch.float32
+        return torch.bfloat16
 
     # TODO: bump base theta more, e.g. 100K is more common more recently
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
@@ -210,7 +228,8 @@ class GPT(nn.Module):
         # calculate the rotation frequencies at each (time, channel) pair
         freqs = torch.outer(t, inv_freq)
         cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.bfloat16(), sin.bfloat16() # keep them in bfloat16
+        target_dtype = self.activation_dtype if self.activation_dtype in {torch.float16, torch.bfloat16} else torch.float32
+        cos, sin = cos.to(target_dtype), sin.to(target_dtype)
         cos, sin = cos[None, :, None, :], sin[None, :, None, :] # add batch and head dims for later broadcasting
         return cos, sin
 
@@ -262,7 +281,7 @@ class GPT(nn.Module):
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
         assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
-        assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"
+        assert self.cos.dtype == self.rotary_dtype, "Rotary embeddings dtype mismatch"
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length

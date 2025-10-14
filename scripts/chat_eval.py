@@ -14,7 +14,14 @@ from functools import partial
 import torch
 import torch.distributed as dist
 
-from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0
+from nanochat.common import (
+    compute_init,
+    compute_cleanup,
+    get_dist_info,
+    print0,
+    autocast_context,
+    preferred_autocast_dtype,
+)
 from nanochat.checkpoint_manager import load_model
 from nanochat.engine import Engine
 
@@ -182,7 +189,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('-i', '--source', type=str, required=True, help="Source of the model: sft|mid|rl")
     parser.add_argument('-a', '--task-name', type=str, default=None, help="Task name. Default = all tasks. Use | to split multiple tasks.")
-    parser.add_argument('-d', '--dtype', type=str, default='bfloat16', choices=['float32', 'bfloat16'])
+    parser.add_argument('-d', '--dtype', type=str, default='bfloat16', choices=['float32', 'bfloat16', 'float16'])
     parser.add_argument('-t', '--temperature', type=float, default=0.0)
     parser.add_argument('-m', '--max-new-tokens', type=int, default=512)
     parser.add_argument('-n', '--num-samples', type=int, default=1)
@@ -194,8 +201,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init()
-    ptdtype = torch.float32 if args.dtype == 'float32' else torch.bfloat16
-    autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=ptdtype)
+    ptdtype = preferred_autocast_dtype(device, args.dtype)
+    autocast_ctx = partial(autocast_context, device=device, dtype=ptdtype)
 
     model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
     engine = Engine(model, tokenizer)
@@ -214,7 +221,7 @@ if __name__ == "__main__":
     # Run all the task evaluations sequentially
     results = {}
     for task_name in task_names:
-        with autocast_ctx:
+        with autocast_ctx():
             acc = run_chat_eval(
                 task_name,
                 model, tokenizer, engine,

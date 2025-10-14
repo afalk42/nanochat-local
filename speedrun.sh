@@ -27,6 +27,22 @@ uv sync
 # activate venv so that `python` uses the project's venv instead of system python
 source .venv/bin/activate
 
+# Detect how many processes to launch with torchrun. Default to 1 when CUDA is unavailable.
+NPROC=$(python - <<'PY'
+import torch
+def detect_nproc():
+    if torch.cuda.is_available():
+        count = torch.cuda.device_count()
+        return count if count > 0 else 1
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return 1
+    return 1
+print(detect_nproc())
+PY
+)
+echo "Using torchrun with $NPROC process(es)."
+TORCHRUN="torchrun --standalone --nproc_per_node=$NPROC"
+
 # -----------------------------------------------------------------------------
 # wandb setup
 # If you wish to use wandb for logging (it's nice!, recommended).
@@ -92,25 +108,25 @@ echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
 # pretrain the d20 model
-torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=20 --run=$WANDB_RUN
+${TORCHRUN} -m scripts.base_train -- --depth=20 --run=$WANDB_RUN
 # evaluate the model on a larger chunk of train/val data and draw some samples
-torchrun --standalone --nproc_per_node=8 -m scripts.base_loss
+${TORCHRUN} -m scripts.base_loss
 # evaluate the model on CORE tasks
-torchrun --standalone --nproc_per_node=8 -m scripts.base_eval
+${TORCHRUN} -m scripts.base_eval
 
 # -----------------------------------------------------------------------------
 # Midtraining (teach the model conversation special tokens, tool use, multiple choice)
 
 # run midtraining and eval the model
-torchrun --standalone --nproc_per_node=8 -m scripts.mid_train -- --run=$WANDB_RUN
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i mid
+${TORCHRUN} -m scripts.mid_train -- --run=$WANDB_RUN
+${TORCHRUN} -m scripts.chat_eval -- -i mid
 
 # -----------------------------------------------------------------------------
 # Supervised Finetuning (domain adaptation to each sequence all by itself per row)
 
 # train sft and re-eval right away (should see a small bump)
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --run=$WANDB_RUN
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i sft
+${TORCHRUN} -m scripts.chat_sft -- --run=$WANDB_RUN
+${TORCHRUN} -m scripts.chat_eval -- -i sft
 
 # chat with the model over CLI! Leave out the -p to chat interactively
 # python -m scripts.chat_cli -p "Why is the sky blue?"

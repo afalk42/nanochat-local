@@ -13,10 +13,22 @@ from collections import deque
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import time
+from functools import partial
+
 import wandb
 import torch
 
-from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir
+from nanochat.common import (
+    compute_init,
+    compute_cleanup,
+    print0,
+    DummyWandb,
+    get_base_dir,
+    autocast_context,
+    preferred_autocast_dtype,
+    device_synchronize,
+    get_peak_memory_bytes,
+)
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint
 from nanochat.loss_eval import evaluate_bpb
@@ -52,8 +64,9 @@ user_config = {k: globals()[k] for k in config_keys} # possibly useful for loggi
 # Compute init
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init()
 master_process = ddp_rank == 0
-dtype = torch.float32 if dtype == 'float32' else torch.bfloat16
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=dtype)
+dtype_choice = dtype
+dtype = preferred_autocast_dtype(device, dtype_choice)
+autocast_ctx = partial(autocast_context, device=device, dtype=dtype)
 
 # wandb logging init
 use_dummy_wandb = run == "dummy" or not master_process
@@ -65,7 +78,11 @@ pretrain_batch_size = meta.get("device_batch_size", None)
 if pretrain_batch_size is not None and device_batch_size > pretrain_batch_size:
     print0(f"FOOTGUN WARNING: base model training used device_batch_size {pretrain_batch_size}, did you pass in a good --device_batch_size to this script?")
 orig_model = model
-model = torch.compile(model, dynamic=False)
+try:
+    model = torch.compile(model, dynamic=False)
+except RuntimeError as err:
+    print0(f"torch.compile unavailable ({err}); continuing with eager mode.")
+    model = orig_model
 depth = model.config.n_layer
 num_flops_per_token = model.estimate_flops()
 tokens_per_fwdbwd = device_batch_size * max_seq_len # tokens per iteration for a single rank
@@ -111,7 +128,8 @@ def mid_data_generator(split):
     assert dataset_size > 0
     needed_tokens = device_batch_size * max_seq_len + 1 # to form one training batch of inputs,targets
     token_buffer = deque()
-    scratch = torch.empty(needed_tokens, dtype=torch.int64, pin_memory=True)
+    pin = device.type == "cuda"
+    scratch = torch.empty(needed_tokens, dtype=torch.int64, pin_memory=pin)
     cursor = ddp_rank # increments by ddp_world_size each time, so each rank processes unique documents
     while True:
         # Accumulate enough tokens for one iteration before yielding
@@ -129,8 +147,9 @@ def mid_data_generator(split):
             scratch[i] = token_buffer.popleft()
         inputs_cpu = scratch[:-1].to(dtype=torch.int32)
         targets_cpu = scratch[1:]
-        inputs = inputs_cpu.view(device_batch_size, max_seq_len).to(device=device, dtype=torch.int32, non_blocking=True)
-        targets = targets_cpu.view(device_batch_size, max_seq_len).to(device=device, dtype=torch.int64, non_blocking=True)
+        non_blocking = device.type != "cpu"
+        inputs = inputs_cpu.view(device_batch_size, max_seq_len).to(device=device, dtype=torch.int32, non_blocking=non_blocking)
+        targets = targets_cpu.view(device_batch_size, max_seq_len).to(device=device, dtype=torch.int64, non_blocking=non_blocking)
         if split == "train":
             approx_progress = cursor / dataset_size # approximate progress as a fraction of the dataset
         yield inputs, targets
@@ -171,7 +190,7 @@ while True:
         model.eval()
         val_loader = build_val_loader()
         eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
-        with autocast_ctx:
+        with autocast_ctx():
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
         if val_bpb < min_val_bpb:
@@ -214,10 +233,10 @@ while True:
     # -------------------------------------------------------------------------
     # single training step
     # evaluate the gradient
-    torch.cuda.synchronize()
+    device_synchronize(device)
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
+        with autocast_ctx():
             loss = model(x, y)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
@@ -235,7 +254,7 @@ while True:
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
-    torch.cuda.synchronize()
+    device_synchronize(device)
     t1 = time.time()
     dt = t1 - t0
     # -------------------------------------------------------------------------
@@ -267,7 +286,14 @@ while True:
         })
 
 # print a few more stats
-print0(f"Peak memory usage: {torch.cuda.max_memory_allocated() / 1024 / 1024:.2f}MiB")
+peak_bytes = get_peak_memory_bytes(device)
+if peak_bytes is not None:
+    peak_mib = peak_bytes / 1024 / 1024
+    peak_memory_str = f"{peak_mib:.2f}MiB"
+    print0(f"Peak memory usage: {peak_memory_str}")
+else:
+    peak_memory_str = "n/a"
+    print0("Peak memory usage: n/a")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 print0(f"Minimum validation bpb: {min_val_bpb:.4f}")
 
@@ -281,6 +307,8 @@ get_report().log(section="Midtraining", data=[
     },
     { # stats about training outcomes
         "Minimum validation bpb": min_val_bpb,
+        "Total training time": f"{total_training_time/60:.2f}m",
+        "Peak memory usage": peak_memory_str,
     }
 ])
 

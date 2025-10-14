@@ -39,27 +39,37 @@ def get_git_info():
     return info
 
 def get_gpu_info():
-    """Get GPU information."""
-    if not torch.cuda.is_available():
-        return {"available": False}
+    """Get accelerator information, covering CUDA and Apple MPS."""
+    if torch.cuda.is_available():
+        num_devices = torch.cuda.device_count()
+        info = {
+            "available": True,
+            "count": num_devices,
+            "names": [],
+            "memory_gb": [],
+            "backend": "cuda",
+        }
 
-    num_devices = torch.cuda.device_count()
-    info = {
-        "available": True,
-        "count": num_devices,
-        "names": [],
-        "memory_gb": []
-    }
+        for i in range(num_devices):
+            props = torch.cuda.get_device_properties(i)
+            info["names"].append(props.name)
+            info["memory_gb"].append(props.total_memory / (1024**3))
 
-    for i in range(num_devices):
-        props = torch.cuda.get_device_properties(i)
-        info["names"].append(props.name)
-        info["memory_gb"].append(props.total_memory / (1024**3))
+        info["cuda_version"] = torch.version.cuda or "unknown"
+        return info
 
-    # Get CUDA version
-    info["cuda_version"] = torch.version.cuda or "unknown"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        # Apple Silicon exposes unified memory; report total system memory for reference.
+        memory_gb = psutil.virtual_memory().total / (1024**3)
+        return {
+            "available": True,
+            "count": 1,
+            "names": ["Apple M-series (MPS)"],
+            "memory_gb": [memory_gb],
+            "backend": "mps",
+        }
 
-    return info
+    return {"available": False}
 
 def get_system_info():
     """Get system information."""
@@ -143,10 +153,13 @@ Generated: {timestamp}
     if gpu_info.get("available"):
         gpu_names = ", ".join(set(gpu_info["names"]))
         total_vram = sum(gpu_info["memory_gb"])
-        header += f"""- GPUs: {gpu_info['count']}x {gpu_names}
-- GPU Memory: {total_vram:.1f} GB total
-- CUDA Version: {gpu_info['cuda_version']}
+        backend = gpu_info.get("backend", "unknown").upper()
+        header += f"""- Accelerators: {gpu_info['count']}x {gpu_names}
+- Accelerator Backend: {backend}
+- Accelerator Memory: {total_vram:.1f} GB total
 """
+        if gpu_info.get("backend") == "cuda":
+            header += f"- CUDA Version: {gpu_info.get('cuda_version', 'unknown')}\n"
     else:
         header += "- GPUs: None available\n"
 

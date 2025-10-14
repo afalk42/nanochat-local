@@ -19,7 +19,13 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
     """
     assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
     a, b, c = (3.4445, -4.7750,  2.0315)
-    X = G.bfloat16()
+    if G.device.type == "mps":
+        target_dtype = torch.float16
+    elif G.device.type == "cpu":
+        target_dtype = torch.float32
+    else:
+        target_dtype = torch.bfloat16
+    X = G.to(dtype=target_dtype)
     if G.size(-2) > G.size(-1):
         X = X.mT
 

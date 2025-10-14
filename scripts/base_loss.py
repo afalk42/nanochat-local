@@ -7,9 +7,16 @@ Example run as:
 torchrun --standalone --nproc_per_node=8 -m scripts.base_loss
 """
 import os
-import torch
+from functools import partial
+
 from nanochat.checkpoint_manager import load_model
-from nanochat.common import compute_init, print0, compute_cleanup
+from nanochat.common import (
+    compute_init,
+    print0,
+    compute_cleanup,
+    autocast_context,
+    preferred_autocast_dtype,
+)
 from nanochat.dataloader import tokenizing_distributed_data_loader
 from nanochat.tokenizer import get_token_bytes
 from nanochat.loss_eval import evaluate_bpb
@@ -28,7 +35,8 @@ model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=mode
 sequence_len = meta["model_config"]["sequence_len"] # could be arbitrary really
 
 # Set up the precision we'll run with
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+amp_dtype = preferred_autocast_dtype(device)
+autocast_ctx = partial(autocast_context, device=device, dtype=amp_dtype)
 
 # Evaluate the loss on each split
 tokens_per_step = device_batch_size * sequence_len * ddp_world_size
@@ -37,8 +45,8 @@ steps = split_tokens // tokens_per_step
 token_bytes = get_token_bytes(device=device)
 bpb_results = {}
 for split_name in ["train", "val"]:
-    loader = tokenizing_distributed_data_loader(device_batch_size, sequence_len, split_name)
-    with autocast_ctx:
+    loader = tokenizing_distributed_data_loader(device_batch_size, sequence_len, split_name, device=device)
+    with autocast_ctx():
         bpb = evaluate_bpb(model, loader, steps, token_bytes)
     print0(f"{split_name} bpb: {bpb:.4f}")
     bpb_results[split_name] = bpb
@@ -58,7 +66,7 @@ if ddp_rank == 0:
     engine = Engine(model, tokenizer)
     for prompt in prompts:
         tokens = tokenizer(prompt, prepend="<|bos|>")
-        with autocast_ctx:
+        with autocast_ctx():
             sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
         sample_str = tokenizer.decode(sample[0])
         print0(sample_str)

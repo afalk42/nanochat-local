@@ -5,6 +5,9 @@ Common utilities for nanochat.
 import os
 import re
 import logging
+from contextlib import nullcontext, AbstractContextManager
+from typing import Optional
+
 import torch
 import torch.distributed as dist
 
@@ -44,6 +47,18 @@ def setup_default_logging():
 
 setup_default_logging()
 logger = logging.getLogger(__name__)
+
+def _is_mps_available() -> bool:
+    """Return True if PyTorch can use Apple's Metal Performance Shaders backend."""
+    return hasattr(torch.backends, "mps") and torch.backends.mps.is_available()  # type: ignore[attr-defined]
+
+def _select_default_device() -> torch.device:
+    """Choose the best available device for single-process execution."""
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if _is_mps_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 def get_base_dir():
     # co-locate nanochat intermediates with other cached data in ~/.cache (by default)
@@ -92,32 +107,35 @@ def get_dist_info():
 def compute_init():
     """Basic initialization that we keep doing over and over, so make common."""
 
-    # CUDA is currently required
-    assert torch.cuda.is_available(), "CUDA is needed for a distributed run atm"
-
     # Reproducibility
     torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
-    # skipping full reproducibility for now, possibly investigate slowdown later
-    # torch.use_deterministic_algorithms(True)
-    # torch.backends.cudnn.deterministic = True
-    # torch.backends.cudnn.benchmark = False
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(42)
 
-    # Precision
     torch.set_float32_matmul_precision("high") # uses tf32 instead of fp32 for matmuls
 
     # Distributed setup: Distributed Data Parallel (DDP), optional
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     if ddp:
+        # DDP currently assumes CUDA/NCCL
+        assert torch.cuda.is_available(), "Distributed execution currently requires CUDA."
         device = torch.device("cuda", ddp_local_rank)
         torch.cuda.set_device(device) # make "cuda" default to this device
         dist.init_process_group(backend="nccl", device_id=device)
         dist.barrier()
     else:
-        device = torch.device("cuda")
+        device = _select_default_device()
+        if device.type == "cuda":
+            torch.cuda.set_device(device)
 
     if ddp_rank == 0:
-        logger.info(f"Distributed world size: {ddp_world_size}")
+        if device.type == "cuda":
+            props = torch.cuda.get_device_properties(device)
+            logger.info(f"Distributed world size: {ddp_world_size} | device: CUDA - {props.name}")
+        elif device.type == "mps":
+            logger.info(f"Distributed world size: {ddp_world_size} | device: MPS (Apple Silicon)")
+        else:
+            logger.info(f"Distributed world size: {ddp_world_size} | device: CPU")
 
     return ddp, ddp_rank, ddp_local_rank, ddp_world_size, device
 
@@ -134,3 +152,70 @@ class DummyWandb:
         pass
     def finish(self):
         pass
+
+def device_synchronize(device: torch.device) -> None:
+    """Synchronize the active device if synchronization is supported."""
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elif device.type == "mps" and hasattr(torch, "mps"):
+        torch.mps.synchronize()  # type: ignore[attr-defined]
+
+def reset_peak_memory_stats(device: torch.device) -> None:
+    """Reset peak memory stats for the active device when supported."""
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device=device)
+    elif device.type == "mps" and hasattr(torch, "mps"):
+        torch.mps.reset_peak_memory_stats()  # type: ignore[attr-defined]
+
+def get_peak_memory_bytes(device: torch.device) -> Optional[int]:
+    """Return peak memory allocated in bytes if supported by the backend."""
+    if device.type == "cuda":
+        return torch.cuda.max_memory_allocated(device=device)
+    if device.type == "mps" and hasattr(torch, "mps"):
+        # torch.mps.current_allocated_memory returns current usage; use that as a best-effort proxy.
+        return torch.mps.current_allocated_memory()  # type: ignore[attr-defined]
+    return None
+
+def autocast_context(*, device: torch.device, dtype: Optional[torch.dtype] = None, enabled: bool = True) -> AbstractContextManager:
+    """Return an autocast context suitable for the provided device."""
+    if not enabled:
+        return nullcontext()
+
+    if device.type == "cuda":
+        chosen_dtype = dtype or torch.bfloat16
+        return torch.amp.autocast(device_type="cuda", dtype=chosen_dtype)
+
+    if device.type == "cpu":
+        chosen_dtype = dtype or torch.bfloat16
+        return torch.amp.autocast(device_type="cpu", dtype=chosen_dtype)
+
+    if device.type == "mps":
+        chosen_dtype = dtype or torch.float16
+        # MPS autocast is only available on newer PyTorch; fall back gracefully.
+        try:
+            return torch.amp.autocast(device_type="mps", dtype=chosen_dtype)
+        except (TypeError, RuntimeError):
+            return nullcontext()
+
+    return nullcontext()
+
+def preferred_autocast_dtype(device: torch.device, requested: Optional[str] = None) -> torch.dtype:
+    """Resolve the dtype string used by CLI flags into a torch.dtype compatible with the device."""
+    if requested is not None:
+        normalized = requested.lower()
+        if normalized in {"bf16", "bfloat16"}:
+            if device.type == "mps":
+                return torch.float16
+            return torch.bfloat16
+        if normalized in {"fp16", "float16", "half"}:
+            if device.type == "cpu":
+                return torch.float32
+            return torch.float16
+        if normalized in {"fp32", "float32"}:
+            return torch.float32
+    # Default selection by device
+    if device.type == "mps":
+        return torch.float16
+    if device.type == "cpu":
+        return torch.float32
+    return torch.bfloat16

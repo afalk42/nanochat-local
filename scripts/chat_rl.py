@@ -19,11 +19,21 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_rl -- --run=default
 import os
 import itertools
 import re
+from functools import partial
+
 import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb
+from nanochat.common import (
+    compute_init,
+    compute_cleanup,
+    print0,
+    get_base_dir,
+    DummyWandb,
+    autocast_context,
+    preferred_autocast_dtype,
+)
 from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.engine import Engine
 from tasks.gsm8k import GSM8K
@@ -56,8 +66,9 @@ user_config = {k: globals()[k] for k in config_keys} # will be useful for loggin
 # Init compute/precision
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init()
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-dtype = torch.float32 if dtype == 'float32' else torch.bfloat16
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=dtype)
+dtype_choice = dtype
+dtype = preferred_autocast_dtype(device, dtype_choice)
+autocast_ctx = partial(autocast_context, device=device, dtype=dtype)
 
 # wandb logging init
 use_dummy_wandb = run == "dummy" or not master_process
@@ -96,7 +107,7 @@ def get_batch():
         num_sampling_steps = num_samples // device_batch_size # go sequentially to prevent OOMs
         for sampling_step in range(num_sampling_steps):
             seed = hash((step, example_idx, sampling_step)) & 0x7FFFFFFF # positive half of int32
-            with autocast_ctx:
+            with autocast_ctx():
                 generated_token_sequences_batch, masks_batch = engine.generate_batch(
                     tokens,
                     num_samples=device_batch_size,
@@ -220,7 +231,7 @@ for step in range(num_steps):
     if step % eval_every == 0:
         model.eval()
         passk = torch.zeros(device_batch_size, device=device) # pass@k for k=1..device_batch_size
-        with autocast_ctx:
+        with autocast_ctx():
             records_iter = run_gsm8k_eval(val_task, tokenizer, engine, num_samples=device_batch_size, max_examples=eval_examples, temperature=1.0)
             records = list(records_iter) # collect all records
         for k in range(1, device_batch_size + 1):
@@ -257,7 +268,7 @@ for step in range(num_steps):
             rewards = rewards_all[b0:b1]
             advantages = advantages_all[b0:b1]
             # Calculate log probabilities. Note that the loss calculates NLL = -logp, so we negate
-            with autocast_ctx:
+            with autocast_ctx():
                 logp = -model(inputs, targets, loss_reduction='none').view_as(inputs) # (B, T)
             # Calculate the PG objective. Note that ignore_index=-1 ensures that invalid tokens have loss 0.
             pg_obj = (logp * advantages.unsqueeze(-1)).sum()

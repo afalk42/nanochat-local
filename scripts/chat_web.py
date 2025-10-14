@@ -8,7 +8,7 @@ Then open http://localhost:8000 in your browser.
 import argparse
 import json
 import os
-import torch
+from functools import partial
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,7 +16,7 @@ from fastapi.responses import StreamingResponse, HTMLResponse, FileResponse
 from pydantic import BaseModel
 from typing import List, Optional, AsyncGenerator
 
-from nanochat.common import compute_init
+from nanochat.common import compute_init, autocast_context, preferred_autocast_dtype
 from nanochat.checkpoint_manager import load_model
 from nanochat.engine import Engine
 
@@ -32,7 +32,8 @@ parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to bind th
 args = parser.parse_args()
 
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init()
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+amp_dtype = preferred_autocast_dtype(device)
+autocast_ctx = partial(autocast_context, device=device, dtype=amp_dtype)
 
 class ChatMessage(BaseModel):
     role: str
@@ -100,7 +101,7 @@ async def generate_stream(
     assistant_end = tokenizer.encode_special("<|assistant_end|>")
     bos = tokenizer.get_bos_token_id()
 
-    with autocast_ctx:
+    with autocast_ctx():
         for token_column, token_masks in engine.generate(
             tokens,
             num_samples=1,
@@ -162,7 +163,7 @@ async def chat_completions(request: ChatRequest):
         max_tokens = request.max_tokens if request.max_tokens is not None else args.max_tokens
         top_k = request.top_k if request.top_k is not None else args.top_k
 
-        with autocast_ctx:
+        with autocast_ctx():
             result_tokens, masks = engine.generate_batch(
                 conversation_tokens,
                 num_samples=1,

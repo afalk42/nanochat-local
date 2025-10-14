@@ -5,8 +5,9 @@ Intended to be run single GPU only atm:
 python -m scripts.chat_cli -i mid
 """
 import argparse
-import torch
-from nanochat.common import compute_init
+from functools import partial
+
+from nanochat.common import compute_init, autocast_context, preferred_autocast_dtype
 from nanochat.engine import Engine
 from nanochat.checkpoint_manager import load_model
 
@@ -21,7 +22,8 @@ args = parser.parse_args()
 
 # Init the model and tokenizer
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init()
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+amp_dtype = preferred_autocast_dtype(device)
+autocast_ctx = partial(autocast_context, device=device, dtype=amp_dtype)
 model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
 
 # Special tokens for the chat state machine
@@ -81,7 +83,7 @@ while True:
     }
     response_tokens = []
     print("\nAssistant: ", end="", flush=True)
-    with autocast_ctx:
+    with autocast_ctx():
         for token_column, token_masks in engine.generate(conversation_tokens, **generate_kwargs):
             token = token_column[0] # pop the batch dimension (num_samples=1)
             response_tokens.append(token)
