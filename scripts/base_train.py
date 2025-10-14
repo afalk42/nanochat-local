@@ -91,7 +91,7 @@ model_dim = depth * 64 # aspect ratio 64 (usually this is varied from 64 -> 128 
 num_heads = max(1, (model_dim + 127) // 128) # head dim 128 (the division here is ceil div)
 num_kv_heads = num_heads # 1:1 MQA ratio
 if device.type == "mps":
-    activation_dtype_name = "float16"
+    activation_dtype_name = "float32"  # MPS lacks loss scaling, prefer fp32 for stability
 elif device.type == "cuda":
     activation_dtype_name = "bfloat16"
 else:

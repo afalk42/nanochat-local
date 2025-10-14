@@ -197,12 +197,10 @@ def autocast_context(*, device: torch.device, dtype: Optional[torch.dtype] = Non
         return torch.amp.autocast(device_type="cpu", dtype=chosen_dtype)
 
     if device.type == "mps":
-        chosen_dtype = dtype or torch.float16
-        # MPS autocast is only available on newer PyTorch; fall back gracefully.
-        try:
-            return torch.amp.autocast(device_type="mps", dtype=chosen_dtype)
-        except (TypeError, RuntimeError):
-            return nullcontext()
+        chosen_dtype = dtype or torch.float32
+        if chosen_dtype != torch.float32:
+            logger.warning("MPS backend forces autocast to fp32 for stability; ignoring requested dtype.")
+        return nullcontext()
 
     return nullcontext()
 
@@ -222,7 +220,7 @@ def preferred_autocast_dtype(device: torch.device, requested: Optional[str] = No
             return torch.float32
     # Default selection by device
     if device.type == "mps":
-        return torch.float16
+        return torch.float32
     if device.type == "cpu":
         return torch.float32
     return torch.bfloat16
